@@ -2,10 +2,14 @@
 
 from collections import Counter
 from contextlib import contextmanager
+import argparse
 from email import policy
 from email.parser import BytesParser
+from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from pathlib import Path
+import re
 import socket
 from threading import Event, Thread
 from urllib.parse import parse_qsl, unquote_plus, urlsplit
@@ -46,7 +50,7 @@ class Fixture:
         self.upload_target = {"method": "http", "path": "/api/v1/job", "hostname": ""}
         self.abort_on_read = False
 
-    def dispatch(self, method, endpoint, params, form, archive):
+    def dispatch(self, method, endpoint, params, form, archive, token):
         job_id = params.get("id")
         action = params.get("action")
         if endpoint == "cem":
@@ -108,6 +112,105 @@ class Fixture:
         return 200, "success", None
 
 
+class AttemptFixture:
+    def __init__(self, cache, *, driver=None, assets=None):
+        if driver is None:
+            driver = (Path(__file__).resolve().parents[1] / "examples" / "attempt_driver.py").read_bytes()
+        self.artifacts = {}
+        entries = []
+        cache.mkdir(parents=True, exist_ok=True)
+        for role, data in {"driver": driver, **(assets or {})}.items():
+            digest = sha256(data).hexdigest()
+            (cache / digest).write_bytes(data)
+            self.artifacts[role] = {"sha256": digest, "sizeBytes": len(data)}
+            entries.append({"role": role, "uri": f"staged:fixture-{role}", **self.artifacts[role]})
+        spec = {
+            "protocol": "attempt-v1", "adapter": "chronos-command@1", "schemaVersion": 1,
+            "system": {"id": 1, "identifier": "fixture-system", "version": "test-1"},
+            "benchmark": {"id": 1, "version": "1", "contract": {
+                "parameters": {"workers": {"type": "integer"}}, "measurement": "Synthetic worker input.",
+                "lifecycle": {"warmUp": "disabled"}, "results": {"workers": {"type": "integer"}},
+            }},
+            "binding": {"id": 1, "version": "1"},
+            "environment": "system-agent", "phases": 2, "parameters": {"workers": 2},
+            "effectiveParameters": {"threads": 2}, "setup": [], "cdl": SYSTEM_CDL,
+            "artifacts": {"schemaVersion": 1, "artifacts": entries, "buildId": "fixture-build"},
+        }
+        spec["sha256"] = sha256(json.dumps(spec).encode()).hexdigest()
+        self.specification = spec
+        self.status = 0
+        self.attempts = []
+        self.tokens = []
+        self.uploads = []
+        self.requests = []
+        self.faults = {}
+        self.counts = Counter()
+        self.abort_on_read = False
+
+    def dispatch(self, method, endpoint, params, form, archive, token):
+        if endpoint != "job" or params.get("protocol") != "attempt-v1":
+            return 600, "Unsupported protocol", None
+        if not token or not re.fullmatch(r"[a-f0-9]{64}", token):
+            return 600, "Invalid attempt token", None
+        job_id = params.get("id")
+        self.tokens.append(token)
+        if method == "GET" and job_id == "next":
+            if (params.get("adapter") != "chronos-command@1" or not params.get("worker")
+                    or "system-" + params.get("environment", "") != self.specification["environment"]):
+                return 601, "No job in queue!", None
+            supports = params.get("supports", "demoall")
+            if supports != "demoall" and "fixture-system" not in supports.split(","):
+                return 601, "No job in queue!", None
+            previous = next((attempt for attempt in self.attempts if attempt["token"] == token), None)
+            if previous is None:
+                if self.status != 0:
+                    return 601, "No job in queue!", None
+                self.attempts.append({"id": 501 + len(self.attempts), "token": token, "worker": params["worker"],
+                                      "status": 1, "log": "", "archive": None, "selected": False})
+                self.status = 1
+            elif self.status not in (1, 2) or params["worker"] != previous["worker"]:
+                return 600, "This attempt no longer owns the repetition.", None
+        elif job_id != "90":
+            return 602, "Job does not exist!", None
+        if not self.attempts or token != self.attempts[-1]["token"]:
+            return 600, "This attempt no longer owns the repetition.", None
+        attempt = self.attempts[-1]
+        if method == "GET":
+            if self.abort_on_read and self.status == 2:
+                self.status = attempt["status"] = -1
+            return 200, "success", {
+                "id": 90, "repetitionId": 90, "attemptId": attempt["id"], "status": self.status,
+                "protocol": "attempt-v1", "specification": self.specification,
+            }
+        if self.status not in (1, 2):
+            return 600, "This attempt no longer owns the repetition.", None
+        if method == "PATCH":
+            target = int(form["status"])
+            result = json.loads(form["result"]) if "result" in form else None
+            if target == 2 and self.status != 1:
+                return 600, "Invalid attempt status transition", None
+            if target == 3 and (self.status != 2 or type((result or {}).get("workers")) is not int
+                                or attempt.get("artifacts") != self.artifacts):
+                return 600, "Please check the submitted values.", None
+            self.status = attempt["status"] = target
+            for field in ("environment", "artifacts", "result"):
+                if field in form:
+                    attempt[field] = json.loads(form[field])
+            if "reason" in form:
+                attempt["reason"] = form["reason"]
+            attempt["selected"] = target == 3
+        elif params.get("action") == "appendLog" and "log" in form:
+            attempt["log"] += form["log"]
+        elif params.get("action") == "upload" and archive is not None:
+            if attempt["archive"] not in (None, archive):
+                return 600, "This attempt already has a different archive.", None
+            attempt["archive"] = archive
+            self.uploads.append(archive)
+        else:
+            return 600, "Unsupported attempt action", None
+        return 200, "success", None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -149,7 +252,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", "/api/v1/job/id=90/action=appendLog")
             self.end_headers()
             return
-        code, message, payload = fixture.dispatch(self.command, endpoint, params, form, archive)
+        code, message, payload = fixture.dispatch(
+            self.command, endpoint, params, form, archive, self.headers.get("X-Chronos-Attempt-Token"),
+        )
         if fault == "drop":
             self.connection.shutdown(socket.SHUT_RDWR)
             return
@@ -178,7 +283,11 @@ def serving(fixture):
 
 
 if __name__ == "__main__":
-    with serving(Fixture()) as url:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--attempt-cache", type=Path, help="Serve an attempt and stage its driver in this cache.")
+    options = parser.parse_args()
+    fixture = AttemptFixture(options.attempt_cache) if options.attempt_cache else Fixture()
+    with serving(fixture) as url:
         print(url, flush=True)
         try:
             Event().wait()

@@ -125,6 +125,21 @@ def _status(value: Any) -> Status:
     raise ProtocolError("Unknown job status.")
 
 
+def _archive_parts(size: int) -> tuple[dict[str, str], bytes, bytes]:
+    boundary = uuid4().hex
+    prefix = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="result"; filename="result.zip"\r\n'
+        "Content-Type: application/zip\r\n\r\n"
+    ).encode("ascii")
+    suffix = f"\r\n--{boundary}--\r\n".encode("ascii")
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Content-Length": str(len(prefix) + size + len(suffix)),
+    }
+    return headers, prefix, suffix
+
+
 def _job(value: Any) -> Job:
     data = _object(value, "Job response")
     if any(not isinstance(data.get(key), str) for key in ("system", "environment", "cdl")):
@@ -137,7 +152,9 @@ def _job(value: Any) -> Job:
 
 
 class Client:
-    """v1 transport. Only explicitly read-only operations can be retried."""
+    """Legacy v1 transport with retries for reads."""
+
+    _response_limit = 2_097_152
 
     def __init__(
         self, base_url: str, *, timeout: float = 10, read_retries: int = 2,
@@ -178,11 +195,11 @@ class Client:
             try:
                 return self._exchange(operation, Request(url, body, headers, method=method), timeout)
             except TransportError as error:
-                if mutates:
-                    raise UncertainWrite(
-                        f"{operation}: acknowledgement lost. Inspect the server state before retrying."
-                    ) from error
                 if attempt + 1 == attempts:
+                    if mutates:
+                        raise UncertainWrite(
+                            f"{operation}: acknowledgement lost. Inspect the server state before retrying."
+                        ) from error
                     raise
                 time.sleep(min(2, self.retry_delay * 2**attempt))
 
@@ -200,11 +217,12 @@ class Client:
         with response:
             status = response.code
             try:
-                raw = response.read(2_097_153)
+                raw = response.read(self._response_limit + 1)
             except (OSError, HTTPException) as error:
                 raise TransportError(f"{operation}: response read failed.") from error
-            if len(raw) > 2_097_152:
-                raise TransportError(f"{operation}: Chronos response exceeds 2 MiB.")
+            if len(raw) > self._response_limit:
+                limit_mib = self._response_limit // (1024 * 1024)
+                raise TransportError(f"{operation}: Chronos response exceeds {limit_mib} MiB.")
             length = response.headers.get("Content-Length")
             if length is not None and (length.lstrip("0") or "0") != str(len(raw)):
                 raise TransportError(f"{operation}: incomplete Chronos response.")
@@ -333,18 +351,8 @@ class Client:
                 raise ProtocolError("HTTP upload origin must match the server or configured upload origin.") from error
             url = hostname.rstrip("/") + path
         url += _segments({"id": job_id, "action": "upload"})
-        boundary = uuid4().hex
-        prefix = (
-            f"--{boundary}\r\n"
-            'Content-Disposition: form-data; name="result"; filename="result.zip"\r\n'
-            "Content-Type: application/zip\r\n\r\n"
-        ).encode("ascii")
-        suffix = f"\r\n--{boundary}--\r\n".encode("ascii")
         with archive.open("rb") as source:
-            headers = {
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Content-Length": str(len(prefix) + os.fstat(source.fileno()).st_size + len(suffix)),
-            }
+            headers, prefix, suffix = _archive_parts(os.fstat(source.fileno()).st_size)
             body = chain([prefix], iter(lambda: source.read(65_536), b""), [suffix])
             self._request(f"upload archive for job {job_id}", "POST", url, body=body,
                           headers=headers, mutates=True)
