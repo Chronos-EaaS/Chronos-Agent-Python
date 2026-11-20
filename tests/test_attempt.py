@@ -156,6 +156,8 @@ import sys
 from pathlib import Path
 Path("evidence/nested").mkdir(parents=True)
 Path("evidence/nested/trace.bin").write_bytes(bytes(range(256)))
+for number in range(98):
+    Path(f"evidence/nested/sample-{{number:02}}.txt").write_text("sample")
 Path("outside.txt").write_text("outside the evidence tree")
 print('{{"workers":2}}')
 print("driver diagnostic", file=sys.stderr)
@@ -168,8 +170,9 @@ sys.exit({exit_code})
                 self.assertEqual({"workers": 2}, attempt["result"])
                 self.assertEqual("driver diagnostic\n", attempt["log"])
                 with ZipFile(BytesIO(attempt["archive"])) as archive:
-                    self.assertEqual({"stdout.json", "stderr.log", "evidence/nested/trace.bin"},
-                                     set(archive.namelist()))
+                    expected_names = {"stdout.json", "stderr.log", "evidence/nested/trace.bin"}
+                    expected_names.update(f"evidence/nested/sample-{number:02}.txt" for number in range(98))
+                    self.assertEqual(expected_names, set(archive.namelist()))
                     self.assertEqual(bytes(range(256)), archive.read("evidence/nested/trace.bin"))
 
     def test_rejects_unsafe_evidence_with_independent_logs_and_result(self):
@@ -212,8 +215,8 @@ print("driver diagnostic", file=sys.stderr)
 
     def test_enforces_driver_evidence_collection_limits(self):
         variants = {
-            "files": ('for i in range(65): Path(f"evidence/{i:02}.txt").touch()', "64 files", 64),
-            "entries": ('for i in range(257): Path(f"evidence/{i:03}").mkdir()', "256 directory entries", 0),
+            "files": ('for i in range(257): Path(f"evidence/{i:03}.txt").touch()', "256 files", 256),
+            "entries": ('for i in range(513): Path(f"evidence/{i:03}").mkdir()', "512 directory entries", 0),
             "bytes": ('''with open("evidence/a.bin", "wb") as output:
     output.truncate(16 * 1024 * 1024)
 Path("evidence/b.txt").write_bytes(b"too large")''', "16 MiB total", 1),

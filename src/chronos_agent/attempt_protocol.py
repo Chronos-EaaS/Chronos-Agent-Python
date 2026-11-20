@@ -9,7 +9,7 @@ import re
 import secrets
 from typing import Any
 
-from .attempt_evidence import MAX_EVIDENCE_BYTES
+from .attempt_evidence import MAX_EVIDENCE_BYTES, MAX_EVIDENCE_FILES, MAX_PATH_BYTES
 from .protocol import (
     ApiError, Client, ProtocolError, Status, _archive_parts, _job_id, _object, _segments, _status,
 )
@@ -18,7 +18,8 @@ from .protocol import (
 PROTOCOL = "attempt-v1"
 ADAPTER = "chronos-command@1"
 MAX_OUTPUT = 1024 * 1024
-MAX_ARCHIVE = MAX_EVIDENCE_BYTES + 3 * MAX_OUTPUT
+# Local ZIP headers and central directory entries each store the member path.
+MAX_ARCHIVE = MAX_EVIDENCE_BYTES + 3 * MAX_OUTPUT + 2 * MAX_EVIDENCE_FILES * MAX_PATH_BYTES
 SHA256_PATTERN = re.compile(r"[a-f0-9]{64}")
 
 
