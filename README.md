@@ -2,9 +2,11 @@
 
 [![Checks](https://github.com/Chronos-EaaS/Chronos-Agent-Python/actions/workflows/checks.yml/badge.svg?branch=main)](https://github.com/Chronos-EaaS/Chronos-Agent-Python/actions/workflows/checks.yml)
 
-Run local benchmark adapters against the Chronos Control v1 job API. The Python SDK, `chronos-agent` command and Bash wrapper use the same lifecycle. The command runner targets Linux and macOS with Python 3.11 or later. The package has no runtime dependencies.
+Connect a benchmark or evaluation script to Chronos Control. The agent picks up jobs, passes their configuration to your workload, and sends progress, logs, results, and artifacts back to Chronos. You can run an existing command from the CLI or add Chronos support to a Python application with the SDK. [Chronos Control](https://github.com/Chronos-EaaS/Chronos-Control) · [Java agent](https://github.com/Chronos-EaaS/Chronos-Agent)
 
-## Install and run
+The package requires Python 3.11 or later and has no runtime dependencies. The command runner supports Linux and macOS.
+
+## Getting started
 
 Clone the repository and install the package in a virtual environment.
 
@@ -16,102 +18,85 @@ python3 -m venv .venv
 python -m pip install .
 ```
 
-For a synthetic end-to-end run, start the in-memory fixture from the repository root in one terminal. It listens on a randomly selected loopback port and starts with one scheduled job.
+### Run an existing command
+
+With a Chronos Control instance running, schedule a job for your system and environment. Give the agent the system identifier and the command to run. Everything after `--` goes to your command as arguments.
 
 ```sh
-python3 tests/mock_server.py
+chronos-agent --url https://chronos.example.org --system my-system --environment default \
+  -- /path/to/benchmark --threads 4
 ```
 
-Set `CHRONOS_URL` to the printed URL in a second terminal, then run the worker using the activated environment. The example copies its arguments and a CDL parameter into a JSON result and uploads a small text artifact.
+The agent keeps polling for jobs. Add `--once` to poll once and run at most one job. Repeat `--system` to support several systems. Run `chronos-agent --help` for the full list of options.
+
+### Try it locally
+
+Start the mock server from the repository root. It runs on loopback and starts with one synthetic job.
+
+```sh
+python tests/mock_server.py
+```
+
+In a second terminal, activate the same virtual environment and set `CHRONOS_URL` to the address printed by the server. Run this from the repository root to see a job produce a JSON result and a text artifact.
 
 ```sh
 chronos-agent --url "$CHRONOS_URL" --system fixture-system --environment agent --once \
-  -- "$(command -v python)" "$PWD/examples/workload.py" 'with spaces' '' '--literal'
+  -- "$(command -v python)" "$PWD/examples/workload.py" "hello from Chronos"
 ```
 
-Restart the fixture to reset its in-memory job before repeating the example via the Bash wrapper or Python SDK.
+The command prints a JSON summary with the run directory. You can use `./examples/agent.sh` in place of `chronos-agent` with the same arguments. The wrapper uses `python3` by default and accepts a Python executable through `PYTHON`. Restart the mock server and update `CHRONOS_URL` before trying another example. [Example workload](examples/workload.py) · [Bash wrapper](examples/agent.sh)
 
-```sh
-PYTHON="$(command -v python)" ./examples/agent.sh \
-  --url "$CHRONOS_URL" --system fixture-system --environment agent --once \
-  -- "$(command -v python)" "$PWD/examples/workload.py" 'A&B + Zürich'
+### Use the Python SDK
 
-python examples/library.py "$CHRONOS_URL"
-```
+Pass your workload function to `Hooks(run=...)` and call `Agent.run_once()` to pick up a job. Each hook receives a `Context` with the parsed CDL (`ctx.cdl.setup` and `ctx.cdl.evaluation`), the run directory, and methods for logging and reporting progress. Set `ctx.result` to a dictionary or write a JSON object to `ctx.result_path`. Put files you want to upload in `ctx.artifacts`. Long-running Python hooks should call `ctx.check()` periodically to handle cancellation and timeouts. [Complete SDK example](examples/library.py)
 
-The worker runs continuously by default and waits `--poll-interval` seconds when the queue is empty. Use repeated `--system` options for systems you explicitly support. For CEM, use `--cem-node NODE_ID --cem-version VERSION --environment NAME`. CEM selects systems configured on the server for that environment. Provision a stable node ID and a version accepted by the server. `--front-controller` enables the `/index.php?/api/v1/` route alias.
+With a fresh mock server, try the SDK example with `python examples/library.py "$CHRONOS_URL"`.
 
-## Workload hooks
+## Set up your workload
 
-Configure commands on the worker. The server supplies CDL data and a phase exclusion mask. The agent executes the configured hooks in this order.
+The run command is the only hook you have to supply. Add setup, warm-up, validation, or teardown with `--setup-json`, `--warmup-json`, `--validate-json`, and `--teardown-json`. These options take JSON arrays of arguments, for example `--validate-json '["/opt/bench/validate", "--strict"]'`. The agent respects the phases enabled for the job in Chronos. If you configure teardown and the job enables it, it also runs after a failed or cancelled workload.
 
-| Hook | Chronos phase | CLI |
-| --- | --- | --- |
-| Setup | 1 PREPARE | `--setup-json` |
-| Warm-up | 2 WARMUP | `--warmup-json` |
-| Run | 3 EXECUTE | Arguments after `--` |
-| Validation | 4 ANALYZE | `--validate-json` |
-| Teardown | 5 CLEAN | `--teardown-json` |
+By default, commands start in a fresh directory under `.chronos-agent/`. Use `--cwd` if your workload needs a specific working directory. The agent provides these environment variables to the command.
 
-The optional hook flags accept JSON argument arrays such as `--validate-json '["/opt/bench/validate", "--strict"]'`. Use an absolute executable path or a command on `PATH`. Each command runs in its job directory unless you set `--cwd`. Commands inherit the worker environment and receive these additional variables.
-
-| Variable | Value |
+| Variable | What it contains |
 | --- | --- |
-| `CHRONOS_JOB_ID` | Legacy job ID |
-| `CHRONOS_SYSTEM`, `CHRONOS_ENVIRONMENT` | System identifier and full server environment |
-| `CHRONOS_PHASE` | Active phase, in lowercase |
-| `CHRONOS_WORK_DIR` | Private per-execution evidence directory |
-| `CHRONOS_CDL` | Absolute path to the raw CDL |
-| `CHRONOS_RESULT_JSON` | Path for an optional UTF-8 JSON object up to 1 MiB |
-| `CHRONOS_ARTIFACTS` | Directory for files to include in the ZIP |
+| `CHRONOS_JOB_ID` | Job ID |
+| `CHRONOS_SYSTEM`, `CHRONOS_ENVIRONMENT` | System identifier and server environment |
+| `CHRONOS_PHASE` | Current phase in lowercase |
+| `CHRONOS_WORK_DIR` | Absolute path to the run directory |
+| `CHRONOS_CDL` | Path to the job configuration in CDL XML |
+| `CHRONOS_RESULT_JSON` | Path where you can write a UTF-8 JSON object up to 1 MiB |
+| `CHRONOS_ARTIFACTS` | Directory for any files you want included in the results ZIP |
 
-A nonzero command exit fails the job. The agent captures combined stdout and stderr locally and sends up to 1,048,576 characters per phase to Chronos at phase boundaries. Keep secrets out of workload logs, results and artifacts. A configured and enabled teardown runs after attempted execution, including local failure or cancellation, with a separate deadline. It sends progress at the phase boundary. Hooks omitted by the operator or excluded by the job mask are skipped. Provisioning logic lives in the setup hook.
+The run directory keeps a copy of the CDL, phase logs, execution metadata, and the job outcome. Chronos receives log output at the end of each phase. A successful run uploads a ZIP with execution metadata and the files you placed in the artifacts directory, then reports the job as finished with the JSON result if you supplied one.
 
-Python hooks receive a `Context` with parsed `cdl.setup` and `cdl.evaluation` mappings, paths and the current phase. Use `ctx.progress(0..100)` to report progress and `ctx.log(text)` to publish diagnostic text at the boundary. Use either `ctx.result` or `ctx.result_path` for results. Call `ctx.check()` regularly inside long-running Python hooks to observe deadline and cancellation. Pass a `threading.Event` to `Agent(stop=...)` to request cancellation from another thread, or use the SDK's `Command` hook for process-level termination.
+## Running an agent
 
-The CLI handles SIGINT and SIGTERM and terminates the command's POSIX process group (TERM, then KILL after a short grace period). Child processes should stay in that group. Status probes detect server-side aborts and other state changes. `--timeout` bounds cooperative workload execution, `--cleanup-timeout` bounds teardown and `--http-timeout` controls the HTTP socket timeout. In-flight network I/O and child termination may delay return.
+For a CEM queue, use `--cem-node NODE_ID --cem-version VERSION --environment NAME` in place of the system selection. Use a stable node ID and a version accepted by your Chronos installation. CEM selects the systems configured for that environment.
 
-## Results and exit codes
+Run one worker per system and environment combination. The v1 system queue reads a candidate and updates its status in separate requests, so two workers that cover the same queue can pick up the same job. If the server may have accepted a write but the agent lost the reply, the agent stops. Check the job, its uploaded files, and the node assignment if you use CEM before restarting.
 
-On success, the agent uploads a ZIP containing `execution.json` and the regular files from `artifacts/`, then sends the result object and finished status in one PATCH. Use `--upload-origin https://uploads.example` if the server advertises an upload origin different from the configured Control origin. Legacy cleartext FTP requires `--ftp-host HOST` with the exact host configured by the server.
-
-The local directory also retains the raw CDL, phase logs, result file when supplied, and `outcome.json`. Execution metadata records the CDL SHA-256, local execution UUID, platform, UTC timestamps, monotonic durations and observed command exit statuses. The execution UUID identifies a local run. Reported durations include agent work around the hooks and serve as execution diagnostics.
-
-Stdout emits a JSON line for each completed job and `{"outcome": "empty"}` for an empty `--once` poll. Diagnostics go to stderr. In continuous mode, per-job failures are reported and polling continues. An API or transport failure stops the worker.
+The CLI writes a JSON summary for each reported job to stdout. Diagnostics go to stderr. With `--once`, the following exit codes let a script decide what to do next.
 
 | Exit | Meaning |
 | --- | --- |
 | 0 | Job finished |
 | 1 | Workload failed or the server stopped it |
 | 2 | Invalid CLI configuration |
-| 3 | Empty queue with `--once` |
-| 5 | API, transport or local I/O error requiring investigation |
-| 124 | Workload or cleanup deadline exceeded |
-| 130 | Job cancelled or SIGINT |
-| 143 | SIGTERM |
+| 3 | Queue was empty |
+| 5 | API, transport, or local I/O error |
+| 124 | Workload or teardown timed out |
+| 130 | Job cancelled or interrupted by SIGINT |
+| 143 | Agent stopped by SIGTERM |
 
-## v1 compatibility and integration
+## Contributing
 
-Use one consumer per system queue partition. System polling is a read followed by a status PATCH, with no atomic claim. CEM reserves a candidate for 60 seconds and uses `jobStarted` and `jobTerminated` to track the node. Both paths still use mutable job-scoped state and evidence. A state probe narrows the race with operator changes.
-
-Retries are bounded and limited to read-only requests. CEM selection can write a reservation and is sent once. Each log write, status change and upload is sent once. An unclear acknowledgement stops processing, keeps local evidence, and requires inspection of the existing job, upload and CEM node state before restarting. An upload can already be present while the job is still running. The v1 API has no idempotency key, attempt identity or atomic result/archive commit.
-
-`Client` owns wire encoding and compatibility. Integrate a future core attempt protocol at the client and lifecycle boundaries after the server advertises the respective capability. Retain the present v1 path for legacy installations and require server-issued attempt IDs and documented replay semantics before enabling attempt-scoped writes.
-
-The v1 contract is defined by `backend/src/Http/Api/V1`, `JobCdlAssembler` and `tests/api/agent-contracts.py` in Chronos Control. [Chronos Control source](https://github.com/Chronos-EaaS/Chronos-Control)
-
-The public Java agent provides a reference for phase masks and upload target handling. [Chronos Agent reference](https://github.com/Chronos-EaaS/Chronos-Agent)
-
-## Local verification
+If you change the agent, run the tests from the repository root. The suite uses a local mock server and synthetic workloads.
 
 ```sh
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+PYTHONPATH=src python -m unittest discover -s tests -v
 ```
-
-The suite uses synthetic commands and ephemeral loopback HTTP servers. FTP client calls are exercised through a local test double. No database or existing Chronos instance is needed.
-
-The Checks workflow runs package installation, CLI and Bash checks, and the test suite on Linux and macOS with Python 3.11 and 3.15.
 
 ## License
 
-[MIT](LICENSE), with the same copyright notice as Chronos Control.
+[MIT](LICENSE).
