@@ -1,0 +1,8 @@
+/build/
+/dist/
+/src/*.egg-info/
+/.venv/
+/.chronos-agent/
+__pycache__/
+*.py[cod]
+.DS_Store
