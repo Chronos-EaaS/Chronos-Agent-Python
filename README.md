@@ -2,7 +2,7 @@
 
 [![Checks](https://github.com/Chronos-EaaS/Chronos-Agent-Python/actions/workflows/checks.yml/badge.svg?branch=main)](https://github.com/Chronos-EaaS/Chronos-Agent-Python/actions/workflows/checks.yml)
 
-Connect a benchmark or evaluation script to Chronos Control. The agent picks up jobs, passes their configuration to your workload, and sends progress, logs, results, and artifacts back to Chronos. You can run an existing command from the CLI or add Chronos support to a Python application with the SDK. [Chronos Control](https://github.com/Chronos-EaaS/Chronos-Control) · [Java agent](https://github.com/Chronos-EaaS/Chronos-Agent)
+Connect a benchmark or evaluation script to Chronos Control. The agent picks up jobs, passes their configuration to your workload, and sends progress, logs, results, and artifacts back to Chronos. You can run an existing command from the CLI or add Chronos support to a Python application with the SDK. [Chronos Control](https://github.com/Chronos-EaaS/Chronos-Control) · [Java agent](https://github.com/Chronos-EaaS/Chronos-Agent-Java)
 
 The package requires Python 3.11 or later and has no runtime dependencies. The command runner supports Linux and macOS.
 
