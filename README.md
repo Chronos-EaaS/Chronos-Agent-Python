@@ -52,6 +52,42 @@ Pass your workload function to `Hooks(run=...)` and call `Agent.run_once()` to p
 
 With a fresh mock server, try the SDK example with `python examples/library.py "$CHRONOS_URL"`.
 
+## Execute a frozen command-adapter repetition
+
+On a Chronos Control instance that supports `attempt-v1`, schedule a repetition for a benchmark binding using `chronos-command@1`. Put each approved manifest artifact in the local cache under its lowercase SHA-256 digest. The agent verifies the declared byte count and SHA-256 of each private copy before starting the driver. The manifest URI records where an artifact came from. The worker reads the bytes from the local cache.
+
+```sh
+chronos-agent --protocol attempt-v1 --url https://chronos.example.org --environment local \
+  --worker benchmark-node-1 --system my-system --artifact-cache /path/to/cache --once
+```
+
+`--system` can be repeated. Omit it to claim any compatible system in the environment. Omit `--once` to keep polling. A CEM bootstrapper can hand off an existing claim with `--attempt-job REPETITION_ID --once` and its `CHRONOS_ATTEMPT_TOKEN` in the agent environment.
+
+The staged `driver` must be a POSIX executable with its dependencies available through absolute paths or the system `PATH`. It receives JSON on stdin with `repetitionId`, `attemptId`, the frozen `specification`, and `artifactPaths` keyed by manifest role. The driver respects the phase exclusions and implements the benchmark's measurement and validation. It writes a JSON result object to stdout and diagnostics to stderr. Exit zero after a successful measurement and validation. The agent reports observed host and artifact metadata, sends stderr to the attempt log, and uploads a ZIP with stdout and stderr. The local evidence directory retains the frozen specification and driver outputs. The summary includes the attempt ID.
+
+To attach reports or traces, write regular files under `evidence/` in the driver's working directory. The worker keeps their relative paths under `evidence/` in the ZIP, including on driver failure. The tree may contain up to 256 files, 16 MiB of file data, and 512 directory entries. Symlinks, hard links, and special files are rejected. Rejected evidence fails the attempt, with the reason and accepted evidence retained alongside stdout and stderr. Configure Chronos Control's upload limit to accommodate the ZIP.
+
+If a start reply is lost, inspect the attempt in Chronos before rescheduling. For a lost completion reply, the worker checks the credentialed attempt status and reports success if Chronos already finished it. A failed or aborted attempt stays in the repetition's history. Rescheduling creates a fresh attempt on the next claim.
+
+### Try an attempt locally
+
+Start the loopback fixture. It stages the synthetic example driver and prints the assigned URL.
+
+```sh
+cache="$(mktemp -d)"
+printf 'Artifact cache %s\n' "$cache"
+python tests/mock_server.py --attempt-cache "$cache"
+```
+
+In a second terminal, use the printed URL as `CHRONOS_URL` and cache directory as `CHRONOS_CACHE`.
+
+```sh
+chronos-agent --protocol attempt-v1 --url "$CHRONOS_URL" --environment agent \
+  --artifact-cache "$CHRONOS_CACHE" --once
+```
+
+The example driver reads the mapped `threads` parameter and returns `{"workers":2}`. [Example driver](examples/attempt_driver.py)
+
 ## Set up your workload
 
 The run command is the only hook you have to supply. Add setup, warm-up, validation, or teardown with `--setup-json`, `--warmup-json`, `--validate-json`, and `--teardown-json`. These options take JSON arrays of arguments, for example `--validate-json '["/opt/bench/validate", "--strict"]'`. The agent respects the phases enabled for the job in Chronos. If you configure teardown and the job enables it, it also runs after a failed or cancelled workload.
@@ -72,9 +108,9 @@ The run directory keeps a copy of the CDL, phase logs, execution metadata, and t
 
 ## Running an agent
 
-For a CEM queue, use `--cem-node NODE_ID --cem-version VERSION --environment NAME` in place of the system selection. Use a stable node ID and a version accepted by your Chronos installation. CEM selects the systems configured for that environment.
+For a legacy CEM queue, use `--cem-node NODE_ID --cem-version VERSION --environment NAME` in place of the system selection. Use a stable node ID and a version accepted by your Chronos installation. CEM selects the systems configured for that environment.
 
-Run one worker per system and environment combination. The v1 system queue reads a candidate and updates its status in separate requests, so two workers that cover the same queue can pick up the same job. If the server may have accepted a write but the agent lost the reply, the agent stops. Check the job, its uploaded files, and the node assignment if you use CEM before restarting.
+Run one legacy worker per system and environment combination. The legacy v1 system queue reads a candidate and updates its status in separate requests, so two workers that cover the same queue can pick up the same job. If the server may have accepted a write but the agent lost the reply, the legacy agent stops. Check the job, its uploaded files, and the node assignment if you use CEM before restarting.
 
 The CLI writes a JSON summary for each reported job to stdout. Diagnostics go to stderr. With `--once`, the following exit codes let a script decide what to do next.
 
