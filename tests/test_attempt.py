@@ -148,8 +148,97 @@ print(json.dumps({"workers": data["specification"]["effectiveParameters"]["threa
         self.assertEqual("bad value\n", attempt["log"])
         self.assertIsNotNone(attempt["archive"])
 
+    def test_archives_nested_driver_evidence_on_success_and_failure(self):
+        for exit_code, expected in ((0, "finished"), (9, "failed")):
+            with self.subTest(exit_code=exit_code):
+                driver = f"""#!/usr/bin/env python3
+import sys
+from pathlib import Path
+Path("evidence/nested").mkdir(parents=True)
+Path("evidence/nested/trace.bin").write_bytes(bytes(range(256)))
+Path("outside.txt").write_text("outside the evidence tree")
+print('{{"workers":2}}')
+print("driver diagnostic", file=sys.stderr)
+sys.exit({exit_code})
+""".encode()
+                fixture = AttemptFixture(self.cache, driver=driver)
+                report = self.run_agent(fixture)
+                self.assertEqual(expected, report.outcome)
+                attempt = fixture.attempts[0]
+                self.assertEqual({"workers": 2}, attempt["result"])
+                self.assertEqual("driver diagnostic\n", attempt["log"])
+                with ZipFile(BytesIO(attempt["archive"])) as archive:
+                    self.assertEqual({"stdout.json", "stderr.log", "evidence/nested/trace.bin"},
+                                     set(archive.namelist()))
+                    self.assertEqual(bytes(range(256)), archive.read("evidence/nested/trace.bin"))
+
+    def test_rejects_unsafe_evidence_with_independent_logs_and_result(self):
+        variants = {
+            "root symlink": ('Path("evidence").symlink_to("private")', "evidence directory"),
+            "nested symlink": ('Path("evidence/unsafe").symlink_to("../private/secret")', "regular file"),
+            "hard link": ('os.link("private/secret", "evidence/unsafe")', "one link"),
+            "FIFO": ('os.mkfifo("evidence/unsafe")', "regular file"),
+            "unsafe path": ('Path("evidence/.. ").mkdir(); Path("evidence/.. /secret").touch()', "Invalid driver evidence path"),
+        }
+        for name, (operation, diagnostic) in variants.items():
+            with self.subTest(kind=name):
+                setup = "" if name == "root symlink" else (
+                    'Path("evidence").mkdir()\nPath("evidence/safe.txt").write_text("retained")'
+                )
+                driver = f"""#!/usr/bin/env python3
+import os, sys
+from pathlib import Path
+Path("private").mkdir()
+Path("private/secret").write_text("outside the evidence tree")
+{setup}
+{operation}
+print('{{"workers":2}}')
+print("driver diagnostic", file=sys.stderr)
+""".encode()
+                fixture = AttemptFixture(self.cache, driver=driver)
+                report = self.run_agent(fixture)
+                self.assertEqual("failed", report.outcome)
+                self.assertIn(diagnostic, report.message)
+                attempt = fixture.attempts[0]
+                self.assertFalse(attempt["selected"])
+                self.assertEqual({"workers": 2}, attempt["result"])
+                self.assertEqual("driver diagnostic\n", attempt["log"])
+                with ZipFile(BytesIO(attempt["archive"])) as archive:
+                    retained = {path for path in archive.namelist() if path.startswith("evidence/")}
+                    self.assertEqual(set() if name == "root symlink" else {"evidence/safe.txt"}, retained)
+                    self.assertIn(diagnostic, archive.read("evidence-error.txt").decode())
+                    if name != "root symlink":
+                        self.assertEqual(b"retained", archive.read("evidence/safe.txt"))
+
+    def test_enforces_driver_evidence_collection_limits(self):
+        variants = {
+            "files": ('for i in range(65): Path(f"evidence/{i:02}.txt").touch()', "64 files", 64),
+            "entries": ('for i in range(257): Path(f"evidence/{i:03}").mkdir()', "256 directory entries", 0),
+            "bytes": ('''with open("evidence/a.bin", "wb") as output:
+    output.truncate(16 * 1024 * 1024)
+Path("evidence/b.txt").write_bytes(b"too large")''', "16 MiB total", 1),
+        }
+        for label, (operation, diagnostic, expected) in variants.items():
+            with self.subTest(limit=label):
+                driver = f"""#!/usr/bin/env python3
+from pathlib import Path
+Path("evidence").mkdir()
+{operation}
+print('{{"workers":2}}')
+""".encode()
+                fixture = AttemptFixture(self.cache, driver=driver)
+                report = self.run_agent(fixture)
+                self.assertEqual("failed", report.outcome)
+                self.assertIn(diagnostic, report.message)
+                with ZipFile(BytesIO(fixture.attempts[0]["archive"])) as archive:
+                    evidence = [file for file in archive.infolist() if file.filename.startswith("evidence/")]
+                    self.assertEqual(expected, len(evidence))
+                    if label == "bytes":
+                        self.assertEqual(16 * 1024 * 1024, evidence[0].file_size)
+                    self.assertEqual({"workers": 2}, json.loads(archive.read("stdout.json")))
+
     def test_operator_abort_stops_driver_and_keeps_local_evidence(self):
-        driver = b"#!/bin/sh\nprintf 'driver started\\n' >&2\nsleep 30\n"
+        driver = b"#!/bin/sh\nprintf 'driver started\\n' >&2\nexec sleep 30\n"
         fixture = AttemptFixture(self.cache, driver=driver)
         fixture.abort_on_read = True
         report = self.run_agent(fixture)
@@ -161,7 +250,7 @@ print(json.dumps({"workers": data["specification"]["effectiveParameters"]["threa
             self.assertEqual(b"driver started\n", bundle.read("stderr.log"))
 
     def test_driver_timeout_records_failure_with_evidence(self):
-        driver = b"#!/bin/sh\nprintf 'before timeout\\n' >&2\nsleep 30\n"
+        driver = b"#!/bin/sh\nprintf 'before timeout\\n' >&2\nexec sleep 30\n"
         fixture = AttemptFixture(self.cache, driver=driver)
         report = self.run_agent(fixture, timeout=2)
         self.assertEqual("timeout", report.outcome)
@@ -170,7 +259,7 @@ print(json.dumps({"workers": data["specification"]["effectiveParameters"]["threa
         self.assertIsNotNone(fixture.attempts[0]["archive"])
 
     def test_local_stop_records_interrupted_attempt(self):
-        driver = b"#!/bin/sh\nprintf 'before interruption\\n' >&2\nsleep 30\n"
+        driver = b"#!/bin/sh\nprintf 'before interruption\\n' >&2\nexec sleep 30\n"
         fixture = AttemptFixture(self.cache, driver=driver)
         evidence = self.evidence
 

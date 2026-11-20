@@ -13,9 +13,11 @@ import stat
 import subprocess
 import tempfile
 import time
+from typing import BinaryIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from .agent import Cancelled, JobTimeout, RunReport, StopSignal
+from .attempt_evidence import collect_driver_evidence, open_directory
 from .attempt_protocol import Attempt, AttemptClient, MAX_OUTPUT, SHA256_PATTERN
 from .command import _stop_group
 from .protocol import AgentError, ApiError, Status, UncertainWrite
@@ -92,14 +94,14 @@ def _check_stop(stop: StopSignal) -> None:
         raise Cancelled("The local agent was interrupted.")
 
 
-def _read_evidence(path: Path) -> bytes:
-    with path.open("rb") as source:
-        return source.read(MAX_OUTPUT)
+def _read_evidence(source: BinaryIO) -> bytes:
+    source.seek(0)
+    return source.read(MAX_OUTPUT)
 
 
-def _result(path: Path) -> str:
-    with path.open("rb") as source:
-        raw = source.read(MAX_OUTPUT + 1)
+def _result(source: BinaryIO) -> str:
+    source.seek(0)
+    raw = source.read(MAX_OUTPUT + 1)
     if len(raw) > MAX_OUTPUT:
         raise DriverFailed("Driver stdout exceeds the 1 MiB result limit.")
     try:
@@ -206,39 +208,16 @@ class AttemptAgent:
 
     def _run_started(self, attempt: Attempt, directory: Path, work: Path,
                      driver_input: Path, driver: Path) -> tuple[str, str]:
-        stdout, stderr = directory / "stdout.json", directory / "stderr.log"
+        stdout_path, stderr_path = directory / "stdout.json", directory / "stderr.log"
         archive = directory / "result.zip"
-        outcome, reason, result = "finished", "", None
-        try:
-            self._run_driver(attempt, work, driver_input, driver, stdout, stderr)
-        except (Cancelled, DriverFailed, JobTimeout, OSError) as error:
-            if isinstance(error, Cancelled):
-                outcome = "cancelled"
-            elif isinstance(error, JobTimeout):
-                outcome = "timeout"
-            else:
-                outcome = "failed"
-            reason = _reason(error)
-        finally:
-            with ZipFile(archive, "w", compression=ZIP_DEFLATED) as bundle:
-                for output in (stdout, stderr):
-                    if output.exists():
-                        bundle.writestr(output.name, _read_evidence(output))
-
-        try:
-            if outcome == "finished" or stdout.exists():
-                result = _result(stdout)
-        except (DriverFailed, OSError) as error:
-            if outcome == "finished":
-                outcome, reason = "failed", _reason(error)
-
+        outcome, reason, result, log = self._collect_outputs(
+            attempt, work, driver_input, driver, stdout_path, stderr_path, archive,
+        )
         self._require_status(attempt, Status.RUNNING)
         try:
             self.client.upload(attempt, archive)
-            if stderr.exists():
-                text = _read_evidence(stderr).decode("utf-8", errors="replace")
-                for offset in range(0, len(text), 32_768):
-                    self.client.log(attempt, text[offset:offset + 32_768])
+            for offset in range(0, len(log), 32_768):
+                self.client.log(attempt, log[offset:offset + 32_768])
         except (AgentError, OSError) as error:
             self._require_status(attempt, Status.RUNNING)
             reason = _reason(error) if not reason else f"{reason} Evidence delivery failed: {_reason(error)}"
@@ -259,12 +238,46 @@ class AttemptAgent:
             return "failed", reason
         return "finished", ""
 
+    def _collect_outputs(self, attempt: Attempt, work: Path, driver_input: Path, driver: Path,
+                         stdout_path: Path, stderr_path: Path, archive: Path) -> tuple[str, str, str | None, str]:
+        outcome, reason, result = "finished", "", None
+        with (open_directory(work) as work_fd, stdout_path.open("x+b") as stdout,
+              stderr_path.open("x+b") as stderr):
+            try:
+                self._run_driver(attempt, work, driver_input, driver, stdout, stderr)
+            except (Cancelled, DriverFailed, JobTimeout, OSError) as error:
+                if isinstance(error, Cancelled):
+                    outcome = "cancelled"
+                elif isinstance(error, JobTimeout):
+                    outcome = "timeout"
+                else:
+                    outcome = "failed"
+                reason = _reason(error)
+            finally:
+                with ZipFile(archive, "x", compression=ZIP_DEFLATED) as bundle:
+                    bundle.writestr(stdout_path.name, _read_evidence(stdout))
+                    log = _read_evidence(stderr)
+                    bundle.writestr(stderr_path.name, log)
+                    evidence_error = collect_driver_evidence(bundle, work_fd)
+                    if evidence_error:
+                        bundle.writestr("evidence-error.txt", evidence_error + "\n")
+            try:
+                result = _result(stdout)
+            except (DriverFailed, OSError) as error:
+                if outcome == "finished":
+                    outcome, reason = "failed", _reason(error)
+        if evidence_error:
+            reason = _reason(DriverFailed(f"{reason} {evidence_error}".strip()))
+            if outcome == "finished":
+                outcome = "failed"
+        return outcome, reason, result, log.decode("utf-8", errors="replace")
+
     def _run_driver(self, attempt: Attempt, work: Path, driver_input: Path, driver: Path,
-                    stdout: Path, stderr: Path) -> None:
+                    output: BinaryIO, log: BinaryIO) -> None:
         _check_stop(self.stop)
         deadline = time.monotonic() + self.timeout
         next_probe = time.monotonic() + self.status_interval
-        with driver_input.open("rb") as source, stdout.open("wb") as output, stderr.open("wb") as log:
+        with driver_input.open("rb") as source:
             process = subprocess.Popen(
                 [str(driver)], cwd=work, env={"PATH": os.defpath}, stdin=source,
                 stdout=output, stderr=log, start_new_session=True,

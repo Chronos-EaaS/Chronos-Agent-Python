@@ -65,6 +65,8 @@ chronos-agent --protocol attempt-v1 --url https://chronos.example.org --environm
 
 The staged `driver` must be a POSIX executable with its dependencies available through absolute paths or the system `PATH`. It receives JSON on stdin with `repetitionId`, `attemptId`, the frozen `specification`, and `artifactPaths` keyed by manifest role. The driver respects the phase exclusions and implements the benchmark's measurement and validation. It writes a JSON result object to stdout and diagnostics to stderr. Exit zero after a successful measurement and validation. The agent reports observed host and artifact metadata, sends stderr to the attempt log, and uploads a ZIP with stdout and stderr. The local evidence directory retains the frozen specification and driver outputs. The summary includes the attempt ID.
 
+To attach reports or traces, write regular files under `evidence/` in the driver's working directory. The worker keeps their relative paths under `evidence/` in the ZIP, including on driver failure. The tree may contain up to 64 files, 16 MiB of file data, and 256 directory entries. Symlinks, hard links, and special files are rejected. Rejected evidence fails the attempt, with the reason and accepted evidence retained alongside stdout and stderr. Configure Chronos Control's upload limit to accommodate the ZIP.
+
 If a start reply is lost, inspect the attempt in Chronos before rescheduling. For a lost completion reply, the worker checks the credentialed attempt status and reports success if Chronos already finished it. A failed or aborted attempt stays in the repetition's history. Rescheduling creates a fresh attempt on the next claim.
 
 ### Try an attempt locally
